@@ -24,6 +24,7 @@
 #ifdef PL_UNIX
 // native calls
 #include <poll.h>
+#include "serial_wakeup.h"
 #include <fcntl.h> /* open() */
 #include <unistd.h> /* close() */
 #include <sys/types.h>
@@ -261,6 +262,7 @@ struct PL_Thread
     std::mutex mtx_tx;
 
     std::condition_variable cv;
+    SerialWakeup wakeup;
 
     // circular buffer pointers
     unsigned rx_a; // read pointer
@@ -273,32 +275,28 @@ static PL_Thread *plThread;
 
 static void PL_Thread0()
 {
-    {
-        std::lock_guard<std::mutex> lock(plThread->mtx_fd);
-        plThread->running = true;
-        plThread->rx_a = 0;
-        plThread->rx_b = 0;
-        plThread->events = 0;
-    }
-
     using namespace std::chrono_literals;
 
     M_ASSERT(platform.fd != 0);
 
-    struct pollfd fds;
+    struct pollfd fds[2];
 
     int nread = 0;
-    int timeout = 2;
 
     for (;;)
     {
         int ret = 0;
 
         {
+            // Drain before checking state: a concurrent producer either has
+            // its state observed below or leaves a readable notification.
+            plThread->wakeup.drain();
             if (!plThread->running)
                 break;
 
-            if (plThread->events & TX_EVENT_ID)
+            int timeout = -1;
+            if ((plThread->events & TX_EVENT_ID) &&
+                !(plThread->events & ERR_EVENT_ID))
             {
                 std::unique_lock<std::mutex> tx_lock(plThread->mtx_tx);
 
@@ -309,20 +307,30 @@ static void PL_Thread0()
                 else
                 {
                     ComPriv->tx();
+                    // Preserve the original pacing for an active TX burst.
+                    // Never wait indefinitely with more queued commands.
+                    if (!TXQ_IsEmpty())
+                        timeout = 2;
+                    else
+                        plThread->events &= ~TX_EVENT_ID;
                 }
             }
 
-            fds.events = POLLIN;
-            fds.fd = platform.fd;
-            ret = poll(&fds, 1 /* nfds*/ , timeout); // ret == 0: timeout | < 0 error
+            fds[0].events = POLLIN;
+            // After a device error, wait for main-thread disconnect without
+            // repeatedly polling an fd which permanently reports POLLHUP.
+            fds[0].fd = (plThread->events & ERR_EVENT_ID) ? -1 : platform.fd;
+            fds[1].events = POLLIN;
+            fds[1].fd = plThread->wakeup.descriptor();
+            ret = poll(fds, 2 /* nfds */, timeout); // ret == 0: timeout | < 0 error
 
             if (ret > 0)
             {
-                if (fds.revents & (POLLHUP | POLLERR | POLLNVAL))
+                if (fds[0].revents & (POLLHUP | POLLERR | POLLNVAL))
                 {
                     plThread->events |= ERR_EVENT_ID;
                 }
-                else if (fds.revents & POLLIN)
+                else if (fds[0].revents & POLLIN)
                 {
                     unsigned maxsize = 0;
 
@@ -604,8 +612,16 @@ static int PL_Connect(const char *path, int baudrate)
     plThread = new PL_Thread;
     plThread->rx_a = 0;
     plThread->rx_b = 0;
-    plThread->running = false;
+    plThread->running = true;
     plThread->events = 0;
+    if (!plThread->wakeup.init())
+    {
+        delete plThread;
+        plThread = nullptr;
+        close(platform.fd);
+        platform.fd = 0;
+        return 0;
+    }
     plThread->th = std::thread(PL_Thread0);
 
     return 1;
@@ -619,6 +635,7 @@ static void PL_Disconnect()
     {
 //        std::lock_guard<std::mutex> lock(plThread->mtx_fd);
         plThread->running = false;
+        plThread->wakeup.notify();
     }
 
     plThread->th.join();
@@ -991,6 +1008,7 @@ int SerialCom::send(zm_command *cmd)
     {
 //        std::unique_lock<std::mutex> fd_lock(plThread->mtx_fd);
         plThread->events |= TX_EVENT_ID;
+        plThread->wakeup.notify();
     }
 #endif
         return 0;
@@ -1032,6 +1050,7 @@ int SerialCom::sendRaw(const uint8_t *data, uint16_t len)
 #ifndef USE_QSERIAL_PORT
     {
         plThread->events |= TX_EVENT_ID;
+        plThread->wakeup.notify();
     }
 #endif
 
@@ -1165,6 +1184,11 @@ int SerialComPrivate::open(int baudrate)
 
 int SerialComPrivate::close()
 {
+    if (PL_IsConnected())
+    {
+        PL_Disconnect();
+    }
+
     if (protId != PROTO_NO_PROTOCOL)
     {
         protocol_remove(protId);
@@ -1176,11 +1200,6 @@ int SerialComPrivate::close()
     sendPos = 0;
 
     closeReason = deCONZ::DeviceDisconnectNormal;
-
-    if (PL_IsConnected())
-    {
-        PL_Disconnect();
-    }
 
     if (comState != ComStateOff)
     {
