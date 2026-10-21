@@ -503,6 +503,7 @@ HttpServer::HttpServer(QObject *parent) :
                 else
                 {
                     DBG_Printf(DBG_ERROR, "HTTPS worker creation failed\n");
+                    // N_Ssl has no API to free the server SSL_CTX, same as on regular shutdown.
                     N_TcpClose(&d->httpsSock.tcp);
                     d->httpsPort = 0;
                 }
@@ -512,6 +513,10 @@ HttpServer::HttpServer(QObject *parent) :
                 DBG_Printf(DBG_INFO, "HTTPS server failed to listen on port: %d\n", d->httpsPort);
                 d->httpsPort = 0;
             }
+        }
+        else
+        {
+            d->httpsPort = 0;
         }
     }
 }
