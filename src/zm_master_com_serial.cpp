@@ -282,15 +282,14 @@ static void PL_Thread0()
     struct pollfd fds[2];
 
     int nread = 0;
+    const auto txInterval = 2ms;
+    auto lastTx = std::chrono::steady_clock::time_point{};
 
     for (;;)
     {
         int ret = 0;
 
         {
-            // Drain before checking state: a concurrent producer either has
-            // its state observed below or leaves a readable notification.
-            plThread->wakeup.drain();
             if (!plThread->running)
                 break;
 
@@ -306,23 +305,49 @@ static void PL_Thread0()
                 }
                 else
                 {
-                    ComPriv->tx();
-                    // Preserve the original pacing for an active TX burst.
-                    // Never wait indefinitely with more queued commands.
-                    if (!TXQ_IsEmpty())
-                        timeout = 2;
+                    // Keep the original 2 ms pacing for a TX burst, also when
+                    // new sends wake the worker before the interval elapsed.
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - lastTx < txInterval)
+                    {
+                        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(txInterval - (now - lastTx)).count();
+                        timeout = int((us + 999) / 1000);
+                    }
                     else
-                        plThread->events &= ~TX_EVENT_ID;
+                    {
+                        ComPriv->tx();
+                        lastTx = now;
+                        if (!TXQ_IsEmpty())
+                            timeout = int(txInterval.count());
+                        else
+                            plThread->events &= ~TX_EVENT_ID;
+                    }
                 }
+            }
+
+            unsigned rxFree;
+            {
+                std::lock_guard<std::mutex> rx_lock(plThread->mtx_rx);
+                rxFree = (TH_RX_BUFFER_SIZE - 1) - (plThread->rx_b - plThread->rx_a);
             }
 
             fds[0].events = POLLIN;
             // After a device error, wait for main-thread disconnect without
             // repeatedly polling an fd which permanently reports POLLHUP.
-            fds[0].fd = (plThread->events & ERR_EVENT_ID) ? -1 : platform.fd;
+            // With a full RX buffer, wait until the main thread consumed data
+            // instead of spinning on a readable fd.
+            fds[0].fd = ((plThread->events & ERR_EVENT_ID) || rxFree == 0) ? -1 : platform.fd;
             fds[1].events = POLLIN;
             fds[1].fd = plThread->wakeup.descriptor();
             ret = poll(fds, 2 /* nfds */, timeout); // ret == 0: timeout | < 0 error
+
+            // Drain before checking state again: a concurrent producer sets its
+            // state before notifying, so it is either observed on the next
+            // iteration or leaves a readable notification.
+            if (ret > 0 && (fds[1].revents & POLLIN))
+            {
+                plThread->wakeup.drain();
+            }
 
             if (ret > 0)
             {
@@ -335,28 +360,9 @@ static void PL_Thread0()
                     unsigned maxsize = 0;
 
                     {
-                        std::unique_lock<std::mutex> tx_lock(plThread->mtx_rx);
-                        unsigned rxa = plThread->rx_a;
-                        unsigned rxb = plThread->rx_b;
-
-                        if (rxa == rxb)
-                        {
-                            maxsize = sizeof(plThread->rxbuf);
-                        }
-                        else
-                        {
-                            for (;(rxb + 1) != rxa; rxb++)
-                            {
-                                maxsize++;
-                                if (maxsize == sizeof(plThread->rxbuf))
-                                        break;
-
-                                if (maxsize == 128)
-                                    break;
-                            }
-
-                            M_ASSERT(maxsize <= sizeof(plThread->rxbuf));
-                        }
+                        std::lock_guard<std::mutex> rx_lock(plThread->mtx_rx);
+                        maxsize = (TH_RX_BUFFER_SIZE - 1) - (plThread->rx_b - plThread->rx_a);
+                        M_ASSERT(maxsize < sizeof(plThread->rxbuf));
                     }
 
                     if (maxsize > 0)
@@ -804,6 +810,10 @@ static void SER_ProcessEvents()
     std::lock_guard<std::mutex> rx_lock(plThread->mtx_rx);
 
     plThread->events &= ~TH0_EVENT_ID;
+    // The worker only signals while TH0_EVENT_ID is clear and otherwise
+    // sleeps in poll(). Wake it so it re-checks events raised meanwhile
+    // (e.g. ERR_EVENT_ID) and resumes reading once RX space is freed.
+    plThread->wakeup.notify();
 
     if (plThread->events == 0)
         return;

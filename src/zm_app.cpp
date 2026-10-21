@@ -52,7 +52,6 @@ void AM_Free(void *ptr)
 static void mqThreadFunc(void *arg)
 {
     U_thread_set_name(&mqThread, "main mq");
-    mqRunning = true;
 
     for (;mqRunning;)
     {
@@ -103,6 +102,8 @@ zmApp::zmApp(int &argc, char **argv) :
     connect(this, &zmApp::amMessageReceived, this, &zmApp::actorTick, Qt::QueuedConnection);
 
     // extra thread to wait for messages
+    // Set before starting the thread so an early shutdown can't be undone.
+    mqRunning = true;
     U_thread_create(&mqThread, mqThreadFunc, &main_mq);
 
     U_TimerInit(AM_ApiFunctions());
