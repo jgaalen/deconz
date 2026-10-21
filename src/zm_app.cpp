@@ -121,8 +121,9 @@ zmApp::~zmApp()
 {
     N_DownloadShutDown();
     AM_UnloadPlugins();
-    AM_Shutdown();
+    // Set the stop flag before AM_Shutdown wakes the message queue thread.
     mqRunning = false;
+    AM_Shutdown();
     U_thread_join(&mqThread);
     U_ASSERT(main_mq == nullptr);
     AM_Destroy();
